@@ -274,22 +274,112 @@ yaml_emitter_set_emitter_error(yaml_emitter_t *emitter, const char *problem)
 }
 
 /*
+ * Enter the terminal error state.
+ *
+ * When the emitter fails, the bytes that reached the write handler are an
+ * arbitrary prefix of the intended stream: nothing may be assumed about them
+ * and no further event may be appended to them.  This function makes that
+ * state explicit:
+ *
+ *  - every event still owned by the emitter is destroyed exactly once (the
+ *    event being processed and all queued events), so nothing is left for a
+ *    later delete to free again;
+ *  - the stacks that describe a healthy stream are unwound and their owned
+ *    strings released;
+ *  - the buffered but not yet written characters are discarded;
+ *  - the emitter is marked as failed and its state machine is parked in the
+ *    terminal state, so later calls fail instead of replaying stale events.
+ *
+ * The function is idempotent: a second call finds empty structures and leaks
+ * or frees nothing.
+ */
+
+void
+yaml_emitter_fail(yaml_emitter_t *emitter)
+{
+    while (!QUEUE_EMPTY(emitter, emitter->events)) {
+        yaml_event_delete(&DEQUEUE(emitter, emitter->events));
+    }
+    emitter->events.head = emitter->events.tail = emitter->events.start;
+
+    while (!STACK_EMPTY(emitter, emitter->states)) {
+        (void)POP(emitter, emitter->states);
+    }
+
+    while (!STACK_EMPTY(emitter, emitter->indents)) {
+        (void)POP(emitter, emitter->indents);
+    }
+
+    while (!STACK_EMPTY(emitter, emitter->tag_directives)) {
+        yaml_tag_directive_t tag_directive = POP(emitter, emitter->tag_directives);
+        yaml_free(tag_directive.handle);
+        yaml_free(tag_directive.prefix);
+    }
+
+    /* The analysis members point into events that are now gone. */
+
+    memset(&emitter->anchor_data, 0, sizeof(emitter->anchor_data));
+    memset(&emitter->tag_data, 0, sizeof(emitter->tag_data));
+    memset(&emitter->scalar_data, 0, sizeof(emitter->scalar_data));
+
+    /* Discard characters that were never handed to the write handler. */
+
+    emitter->buffer.last = emitter->buffer.pointer = emitter->buffer.start;
+    emitter->raw_buffer.last = emitter->raw_buffer.pointer = emitter->raw_buffer.start;
+
+    emitter->indent = 0;
+    emitter->flow_level = 0;
+    emitter->root_context = 0;
+    emitter->sequence_context = 0;
+    emitter->mapping_context = 0;
+    emitter->simple_key_context = 0;
+    emitter->open_ended = 0;
+    emitter->whitespace = 0;
+    emitter->indention = 0;
+
+    emitter->state = YAML_EMIT_FAILED_STATE;
+}
+
+/*
  * Emit an event.
  */
 
 YAML_DECLARE(int)
 yaml_emitter_emit(yaml_emitter_t *emitter, yaml_event_t *event)
 {
-    if (!ENQUEUE(emitter, emitter->events, *event)) {
+    /*
+     * A failed emitter is terminal: the document is known to be incomplete,
+     * so it accepts nothing more.  The event is still released, as promised
+     * by the API, but it is never queued and therefore never replayed.
+     */
+    if (emitter->state == YAML_EMIT_FAILED_STATE) {
         yaml_event_delete(event);
         return 0;
     }
 
+    /*
+     * The emitter takes over the event contents: the queued copy owns the
+     * memory from now on, and the caller's slot is emptied so that it can be
+     * neither destroyed a second time nor replayed into another emitter.
+     */
+    if (!ENQUEUE(emitter, emitter->events, *event)) {
+        yaml_event_delete(event);
+        yaml_emitter_fail(emitter);
+        return 0;
+    }
+    memset(event, 0, sizeof(yaml_event_t));
+
     while (!yaml_emitter_need_more_events(emitter)) {
-        if (!yaml_emitter_analyze_event(emitter, emitter->events.head))
+        if (!yaml_emitter_analyze_event(emitter, emitter->events.head)
+                || !yaml_emitter_state_machine(emitter, emitter->events.head)) {
+            /*
+             * The failed (or still queued) events belong to the emitter; the
+             * terminal state destroys all of them, including the one whose
+             * processing just failed.
+             */
+            yaml_emitter_fail(emitter);
             return 0;
-        if (!yaml_emitter_state_machine(emitter, emitter->events.head))
-            return 0;
+        }
         yaml_event_delete(&DEQUEUE(emitter, emitter->events));
     }
 
@@ -479,6 +569,13 @@ yaml_emitter_state_machine(yaml_emitter_t *emitter, yaml_event_t *event)
         case YAML_EMIT_END_STATE:
             return yaml_emitter_set_emitter_error(emitter,
                     "expected nothing after STREAM-END");
+
+        case YAML_EMIT_FAILED_STATE:
+            /*
+             * Unreachable: yaml_emitter_emit() refuses to process events in
+             * this state.  Do not overwrite the error that caused the failure.
+             */
+            return 0;
 
         default:
             assert(1);      /* Invalid state. */

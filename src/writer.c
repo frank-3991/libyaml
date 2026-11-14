@@ -13,6 +13,10 @@ yaml_emitter_flush(yaml_emitter_t *emitter);
 
 /*
  * Set the writer error and return 0.
+ *
+ * A failed write is unrecoverable: the bytes handed to the handler so far are
+ * an unknown prefix of the intended stream, so the emitter is moved into its
+ * terminal state and refuses any further work.
  */
 
 static int
@@ -20,6 +24,8 @@ yaml_emitter_set_writer_error(yaml_emitter_t *emitter, const char *problem)
 {
     emitter->error = YAML_WRITER_ERROR;
     emitter->problem = problem;
+
+    yaml_emitter_fail(emitter);
 
     return 0;
 }
@@ -34,6 +40,16 @@ yaml_emitter_flush(yaml_emitter_t *emitter)
     int low, high;
 
     assert(emitter);    /* Non-NULL emitter object is expected. */
+
+    /*
+     * A failed emitter must never write more bytes to the output.  Check this
+     * before the other preconditions: a failure may have happened before the
+     * encoding or the write handler was set up.
+     */
+
+    if (emitter->state == YAML_EMIT_FAILED_STATE)
+        return 0;
+
     assert(emitter->write_handler); /* Write handler must be set. */
     assert(emitter->encoding);  /* Output encoding must be set. */
 

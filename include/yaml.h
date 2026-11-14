@@ -1551,7 +1551,15 @@ typedef enum yaml_emitter_state_e {
     /** Expect a value of a block mapping. */
     YAML_EMIT_BLOCK_MAPPING_VALUE_STATE,
     /** Expect nothing. */
-    YAML_EMIT_END_STATE
+    YAML_EMIT_END_STATE,
+    /**
+     * Terminal state after an unrecoverable error.
+     *
+     * The emitter entered this state because its output is known to be an
+     * incomplete prefix of the intended stream.  No event is accepted in this
+     * state; a new emitter object is required to produce a new stream.
+     */
+    YAML_EMIT_FAILED_STATE
 } yaml_emitter_state_t;
 
 
@@ -1942,6 +1950,15 @@ yaml_emitter_set_break(yaml_emitter_t *emitter, yaml_break_t line_break);
  * content after it is emitted. The event object is destroyed even if the
  * function fails.
  *
+ * On return the event has been emptied, so it owns no memory and destroying it
+ * again is harmless.
+ *
+ * If an emitter fails, it becomes terminal: the output produced so far is an
+ * incomplete prefix of the intended stream, and the emitter will neither
+ * write more characters nor accept more events.  Every later call returns
+ * @c 0 (and still destroys the given event).  A new emitter object is
+ * required to produce a new stream.
+ *
  * @param[in,out]   emitter     An emitter object.
  * @param[in,out]   event       An event object.
  *
@@ -1969,6 +1986,10 @@ yaml_emitter_open(yaml_emitter_t *emitter);
  *
  * This function should be used after yaml_emitter_dump() is called.
  *
+ * @c 0 is returned, without writing anything, if the emitter has failed.
+ * Callers should use that return value to tell a complete document from a
+ * partial one.
+ *
  * @param[in,out]   emitter     An emitter object.
  *
  * @returns @c 1 if the function succeeded, @c 0 on error.
@@ -1985,6 +2006,9 @@ yaml_emitter_close(yaml_emitter_t *emitter);
  * responsibility for the document object and destroys its content after
  * it is emitted. The document object is destroyed even if the function fails.
  *
+ * The document is also destroyed when the emitter has already failed, in
+ * which case @c 0 is returned without producing any output.
+ *
  * @param[in,out]   emitter     An emitter object.
  * @param[in,out]   document    A document object.
  *
@@ -1996,6 +2020,9 @@ yaml_emitter_dump(yaml_emitter_t *emitter, yaml_document_t *document);
 
 /**
  * Flush the accumulated characters to the output.
+ *
+ * @c 0 is returned, without calling the write handler, if the emitter has
+ * failed.
  *
  * @param[in,out]   emitter     An emitter object.
  *

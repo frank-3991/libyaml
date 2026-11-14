@@ -67,6 +67,9 @@ yaml_emitter_open(yaml_emitter_t *emitter)
     assert(emitter);            /* Non-NULL emitter object is required. */
     assert(!emitter->opened);   /* Emitter should not be opened yet. */
 
+    if (emitter->state == YAML_EMIT_FAILED_STATE)
+        return 0;
+
     STREAM_START_EVENT_INIT(event, YAML_ANY_ENCODING, mark, mark);
 
     if (!yaml_emitter_emit(emitter, &event)) {
@@ -89,6 +92,17 @@ yaml_emitter_close(yaml_emitter_t *emitter)
     yaml_mark_t mark = { 0, 0, 0 };
 
     assert(emitter);            /* Non-NULL emitter object is required. */
+
+    /*
+     * Closing a failed emitter must never report success: the stream it
+     * produced may be truncated, and the return value is the only signal the
+     * caller has for telling a complete document from a partial prefix.  The
+     * check comes before the "opened" assertion because opening the stream
+     * may itself have failed.
+     */
+    if (emitter->state == YAML_EMIT_FAILED_STATE)
+        return 0;
+
     assert(emitter->opened);    /* Emitter should be opened. */
 
     if (emitter->closed) return 1;
@@ -116,6 +130,16 @@ yaml_emitter_dump(yaml_emitter_t *emitter, yaml_document_t *document)
 
     assert(emitter);            /* Non-NULL emitter object is required. */
     assert(document);           /* Non-NULL emitter object is expected. */
+
+    /*
+     * The emitter has already failed: it cannot emit this document, and its
+     * output is an incomplete prefix.  The document is still consumed so the
+     * caller's obligations stay the same in both outcomes.
+     */
+    if (emitter->state == YAML_EMIT_FAILED_STATE) {
+        yaml_document_delete(document);
+        return 0;
+    }
 
     emitter->document = document;
 
@@ -153,6 +177,21 @@ yaml_emitter_dump(yaml_emitter_t *emitter, yaml_document_t *document)
     return 1;
 
 error:
+
+    /*
+     * The document may have been partially written, so the emitter can no
+     * longer produce a complete stream.  Enter the terminal state (which is
+     * a no-op if an emit already did it) before releasing the document, and
+     * make sure an error is reported even when the failure came from a local
+     * allocation rather than from the emitter.
+     */
+    if (emitter->state != YAML_EMIT_FAILED_STATE) {
+        if (!emitter->error) {
+            emitter->error = YAML_MEMORY_ERROR;
+            emitter->problem = "memory error";
+        }
+        yaml_emitter_fail(emitter);
+    }
 
     yaml_emitter_delete_document_and_anchors(emitter);
 

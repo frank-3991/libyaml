@@ -39,6 +39,17 @@ YAML_DECLARE(int)
 yaml_parser_fetch_more_tokens(yaml_parser_t *parser);
 
 /*
+ * Emitter: Enter the terminal error state.
+ *
+ * Releases every event still owned by the emitter, unwinds the emitter state
+ * and prevents any further output.  It is safe to call this function more than
+ * once, and safe to call it before yaml_emitter_delete().
+ */
+
+void
+yaml_emitter_fail(yaml_emitter_t *emitter);
+
+/*
  * The size of the input raw buffer.
  */
 
