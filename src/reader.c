@@ -19,6 +19,24 @@ YAML_DECLARE(int)
 yaml_parser_update_buffer(yaml_parser_t *parser, size_t length);
 
 /*
+ * Decide whether an invalid input byte may be reported yet.
+ *
+ * The decoder converts the whole raw buffer in one pass, but the scanner only
+ * asks for the few characters it needs.  Reporting an invalid byte as soon as
+ * the decoder walks over it would make the error depend on how many bytes the
+ * read handler happened to deliver in a single call: a large chunk reports the
+ * error before any event is produced, while a small chunk produces the events
+ * for the preceding characters first.
+ *
+ * When the caller already has the characters it asked for, stop in front of
+ * the invalid byte instead of reporting it.  The raw buffer keeps pointing at
+ * that byte, so the next call that actually needs it raises the very same
+ * error, at the very same offset.
+ */
+
+#define POSTPONE_READER_ERROR(parser,length)  ((parser)->unread >= (length))
+
+/*
  * Set the reader error and return 0.
  */
 
@@ -235,15 +253,20 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                     /* Check if the leading octet is valid. */
 
-                    if (!width)
+                    if (!width) {
+                        if (POSTPONE_READER_ERROR(parser, length))
+                            goto postponed;
                         return yaml_parser_set_reader_error(parser,
                                 "invalid leading UTF-8 octet",
                                 parser->offset, octet);
+                    }
 
                     /* Check if the raw buffer contains an incomplete character. */
 
                     if (width > raw_unread) {
                         if (parser->eof) {
+                            if (POSTPONE_READER_ERROR(parser, length))
+                                goto postponed;
                             return yaml_parser_set_reader_error(parser,
                                     "incomplete UTF-8 octet sequence",
                                     parser->offset, -1);
@@ -267,10 +290,13 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                         /* Check if the octet is valid. */
 
-                        if ((octet & 0xC0) != 0x80)
+                        if ((octet & 0xC0) != 0x80) {
+                            if (POSTPONE_READER_ERROR(parser, length))
+                                goto postponed;
                             return yaml_parser_set_reader_error(parser,
                                     "invalid trailing UTF-8 octet",
                                     parser->offset+k, octet);
+                        }
 
                         /* Decode the octet. */
 
@@ -282,17 +308,23 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
                     if (!((width == 1) ||
                             (width == 2 && value >= 0x80) ||
                             (width == 3 && value >= 0x800) ||
-                            (width == 4 && value >= 0x10000)))
+                            (width == 4 && value >= 0x10000))) {
+                        if (POSTPONE_READER_ERROR(parser, length))
+                            goto postponed;
                         return yaml_parser_set_reader_error(parser,
                                 "invalid length of a UTF-8 sequence",
                                 parser->offset, -1);
+                    }
 
                     /* Check the range of the value. */
 
-                    if ((value >= 0xD800 && value <= 0xDFFF) || value > 0x10FFFF)
+                    if ((value >= 0xD800 && value <= 0xDFFF) || value > 0x10FFFF) {
+                        if (POSTPONE_READER_ERROR(parser, length))
+                            goto postponed;
                         return yaml_parser_set_reader_error(parser,
                                 "invalid Unicode character",
                                 parser->offset, value);
+                    }
 
                     break;
 
@@ -332,6 +364,8 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                     if (raw_unread < 2) {
                         if (parser->eof) {
+                            if (POSTPONE_READER_ERROR(parser, length))
+                                goto postponed;
                             return yaml_parser_set_reader_error(parser,
                                     "incomplete UTF-16 character",
                                     parser->offset, -1);
@@ -347,10 +381,13 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                     /* Check for unexpected low surrogate area. */
 
-                    if ((value & 0xFC00) == 0xDC00)
+                    if ((value & 0xFC00) == 0xDC00) {
+                        if (POSTPONE_READER_ERROR(parser, length))
+                            goto postponed;
                         return yaml_parser_set_reader_error(parser,
                                 "unexpected low surrogate area",
                                 parser->offset, value);
+                    }
 
                     /* Check for a high surrogate area. */
 
@@ -362,6 +399,8 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                         if (raw_unread < 4) {
                             if (parser->eof) {
+                                if (POSTPONE_READER_ERROR(parser, length))
+                                    goto postponed;
                                 return yaml_parser_set_reader_error(parser,
                                         "incomplete UTF-16 surrogate pair",
                                         parser->offset, -1);
@@ -377,10 +416,13 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
 
                         /* Check for a low surrogate area. */
 
-                        if ((value2 & 0xFC00) != 0xDC00)
+                        if ((value2 & 0xFC00) != 0xDC00) {
+                            if (POSTPONE_READER_ERROR(parser, length))
+                                goto postponed;
                             return yaml_parser_set_reader_error(parser,
                                     "expected low surrogate area",
                                     parser->offset+2, value2);
+                        }
 
                         /* Generate the value of the surrogate pair. */
 
@@ -412,10 +454,13 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
                         || (value >= 0x20 && value <= 0x7E)
                         || (value == 0x85) || (value >= 0xA0 && value <= 0xD7FF)
                         || (value >= 0xE000 && value <= 0xFFFD)
-                        || (value >= 0x10000 && value <= 0x10FFFF)))
+                        || (value >= 0x10000 && value <= 0x10FFFF))) {
+                if (POSTPONE_READER_ERROR(parser, length))
+                    goto postponed;
                 return yaml_parser_set_reader_error(parser,
                         "control characters are not allowed",
                         parser->offset, value);
+            }
 
             /* Move the raw pointers. */
 
@@ -459,6 +504,14 @@ yaml_parser_update_buffer(yaml_parser_t *parser, size_t length)
         }
 
     }
+
+    /*
+     * An invalid byte was found, but the caller already has the characters it
+     * asked for.  Leave the raw buffer pointing at that byte so that the next
+     * call needing it reports the same error at the same offset.
+     */
+
+postponed:
 
     if (parser->offset >= MAX_FILE_SIZE) {
         return yaml_parser_set_reader_error(parser, "input is too long",

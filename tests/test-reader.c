@@ -347,8 +347,386 @@ int check_long_utf16(void)
     return failed;
 }
 
+/*
+ * Chunking independence of the reader diagnostics.
+ *
+ * The read handler decides how many bytes the parser sees per call, and the
+ * input is untrusted: an attacker feeding the parser from a socket picks
+ * those boundaries.  The reader converts the whole raw buffer in one pass, so
+ * before the fix an invalid byte was reported as soon as the decoder walked
+ * over it.  With a large chunk that happened before any event was produced;
+ * with a small chunk the events for the preceding characters came out first.
+ *
+ * These tests drive the same bytes through a handler with many chunk sizes and
+ * require the reader diagnostics (category, offset and value) and the number
+ * and order of the events produced before them to be identical.  That pins the
+ * rejected byte's position to the original input and keeps hostile bytes from
+ * being read as a valid document just because they arrived in a big chunk.
+ */
+
+typedef struct {
+    const unsigned char *data;
+    size_t length;
+    size_t position;
+    size_t chunk;
+} chunked_source;
+
+static int
+chunked_read_handler(void *data, unsigned char *buffer, size_t size,
+        size_t *size_read)
+{
+    chunked_source *source = (chunked_source *)data;
+    size_t remaining = source->length - source->position;
+
+    if (!remaining) {
+        *size_read = 0;
+        return 1;
+    }
+    if (size > source->chunk)
+        size = source->chunk;
+    if (size > remaining)
+        size = remaining;
+
+    memcpy(buffer, source->data + source->position, size);
+    source->position += size;
+    *size_read = size;
+
+    return 1;
+}
+
+typedef struct {
+    int type;
+    int failed;
+    char problem[64];
+    size_t offset;
+    int value;
+    size_t event_count;
+    int events[32];
+} read_outcome;
+
+static void
+run_chunked(const unsigned char *data, size_t length, int whole, size_t chunk,
+        read_outcome *outcome)
+{
+    yaml_parser_t parser;
+    yaml_event_t event;
+    chunked_source source;
+
+    memset(outcome, 0, sizeof(*outcome));
+    source.data = data;
+    source.length = length;
+    source.position = 0;
+    source.chunk = chunk;
+
+    assert(yaml_parser_initialize(&parser));
+    if (whole)
+        yaml_parser_set_input_string(&parser, data, length);
+    else
+        yaml_parser_set_input(&parser, chunked_read_handler, &source);
+
+    for (;;) {
+        if (!yaml_parser_parse(&parser, &event)) {
+            outcome->failed = 1;
+            outcome->type = parser.error;
+            outcome->offset = parser.problem_offset;
+            outcome->value = parser.problem_value;
+            if (parser.problem) {
+                strncpy(outcome->problem, parser.problem,
+                        sizeof(outcome->problem) - 1);
+                outcome->problem[sizeof(outcome->problem) - 1] = '\0';
+            }
+            break;
+        }
+        if (outcome->event_count < 32)
+            outcome->events[outcome->event_count] = event.type;
+        outcome->event_count++;
+        if (event.type == YAML_STREAM_END_EVENT) {
+            yaml_event_delete(&event);
+            break;
+        }
+        yaml_event_delete(&event);
+        if (outcome->event_count > 64) {
+            outcome->failed = 1;
+            outcome->type = -1;
+            break;
+        }
+    }
+
+    yaml_parser_delete(&parser);
+}
+
+static int
+check_chunking(const char *title, const unsigned char *data, size_t length,
+        int expect_failure)
+{
+    static const size_t chunks[] = { 1, 2, 3, 4, 5, 7, 13, 64, 16384 };
+    read_outcome reference;
+    read_outcome current;
+    size_t i;
+    int failed = 0;
+
+    run_chunked(data, length, 1, 0, &reference);
+
+    if (expect_failure != reference.failed) {
+        printf("\t%s: contiguous read %s, expected the opposite\n", title,
+                reference.failed ? "failed" : "succeeded");
+        return 1;
+    }
+
+    for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        size_t j;
+
+        run_chunked(data, length, 0, chunks[i], &current);
+
+        if (current.failed != reference.failed
+                || current.type != reference.type
+                || current.offset != reference.offset
+                || current.value != reference.value
+                || strcmp(current.problem, reference.problem)) {
+            printf("\t%s: chunk=%lu reported %d '%s' at %lu/#%X, "
+                    "contiguous read reported %d '%s' at %lu/#%X\n", title,
+                    (unsigned long)chunks[i], current.type, current.problem,
+                    (unsigned long)current.offset, current.value,
+                    reference.type, reference.problem,
+                    (unsigned long)reference.offset, reference.value);
+            failed++;
+            continue;
+        }
+
+        /*
+         * The diagnostic must be reached at the same point of the character
+         * stream, so the events produced before it must match exactly too.
+         * Anything else would mean the invalid byte was reported earlier or
+         * later depending on how the bytes happened to be split.
+         */
+        if (current.event_count != reference.event_count) {
+            printf("\t%s: chunk=%lu produced %lu events before the error, "
+                    "contiguous read produced %lu\n", title,
+                    (unsigned long)chunks[i],
+                    (unsigned long)current.event_count,
+                    (unsigned long)reference.event_count);
+            failed++;
+            continue;
+        }
+        for (j = 0; j < reference.event_count && j < 32; j++) {
+            if (current.events[j] != reference.events[j]) {
+                printf("\t%s: chunk=%lu event %lu is %d, contiguous read "
+                        "has %d\n", title, (unsigned long)chunks[i],
+                        (unsigned long)j, current.events[j],
+                        reference.events[j]);
+                failed++;
+                break;
+            }
+        }
+    }
+
+    printf("\t%s: %s\n", title, failed ? "-" : "+");
+    return failed;
+}
+
+/*
+ * A read handler that fails after a fixed number of bytes.  Whatever the chunk
+ * size, a failure at byte N must be reported as "input error" and must stay
+ * distinguishable from an encoding problem: hostile bytes must not turn an
+ * interrupted stream into a parsed one, or the other way round.
+ */
+
+typedef struct {
+    const unsigned char *data;
+    size_t length;
+    size_t position;
+    size_t chunk;
+    size_t failure_position;
+} failing_source;
+
+static int
+failing_read_handler(void *data, unsigned char *buffer, size_t size,
+        size_t *size_read)
+{
+    failing_source *source = (failing_source *)data;
+    size_t remaining;
+
+    if (source->position >= source->failure_position) {
+        *size_read = 0;
+        return 0;
+    }
+
+    remaining = source->length - source->position;
+    if (!remaining) {
+        *size_read = 0;
+        return 1;
+    }
+    if (size > source->chunk)
+        size = source->chunk;
+    if (size > remaining)
+        size = remaining;
+    if (size > source->failure_position - source->position)
+        size = source->failure_position - source->position;
+
+    memcpy(buffer, source->data + source->position, size);
+    source->position += size;
+    *size_read = size;
+
+    return 1;
+}
+
+static int
+check_handler_failure(const char *title, const unsigned char *data,
+        size_t length, size_t failure_position)
+{
+    static const size_t chunks[] = { 1, 2, 3, 4, 5, 7, 13, 64, 16384 };
+    int expected_type = -1;
+    size_t expected_events = 0;
+    size_t expected_offset = 0;
+    size_t i;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        yaml_parser_t parser;
+        yaml_event_t event;
+        failing_source source;
+        size_t events = 0;
+        int type;
+        size_t offset;
+
+        source.data = data;
+        source.length = length;
+        source.position = 0;
+        source.chunk = chunks[i];
+        source.failure_position = failure_position;
+
+        assert(yaml_parser_initialize(&parser));
+        yaml_parser_set_input(&parser, failing_read_handler, &source);
+
+        for (;;) {
+            assert(events <= 64);
+            if (!yaml_parser_parse(&parser, &event))
+                break;
+            events++;
+            if (event.type == YAML_STREAM_END_EVENT) {
+                yaml_event_delete(&event);
+                break;
+            }
+            yaml_event_delete(&event);
+        }
+
+        type = parser.error;
+        offset = parser.problem_offset;
+        yaml_parser_delete(&parser);
+
+        if (!i) {
+            expected_type = type;
+            expected_events = events;
+            expected_offset = offset;
+        }
+        else if (type != expected_type || events != expected_events
+                || offset != expected_offset) {
+            printf("\t%s: chunk=%lu reported type %d at offset %lu after %lu "
+                    "events, chunk=1 reported type %d at offset %lu after %lu "
+                    "events\n", title, (unsigned long)chunks[i], type,
+                    (unsigned long)offset, (unsigned long)events,
+                    expected_type, (unsigned long)expected_offset,
+                    (unsigned long)expected_events);
+            failed++;
+        }
+    }
+
+    /*
+     * The failure must be an "input error", never an encoding diagnostic: an
+     * interrupted stream is not the same thing as malformed bytes.
+     */
+    if (expected_type != YAML_READER_ERROR) {
+        printf("\t%s: interrupted input reported error type %d\n", title,
+                expected_type);
+        failed++;
+    }
+
+    printf("\t%s: %s\n", title, failed ? "-" : "+");
+    return failed;
+}
+
+int check_interrupted_input(void)
+{
+    static const unsigned char valid[] = "a: caf\xc3\xa9\nb: [1, 2]\n";
+    static const unsigned char with_bad_byte[] = "a: caf\xc3\xa9\nb: \xff\n";
+    int failed = 0;
+
+    printf("checking interrupted input diagnostics...\n");
+
+    failed += check_handler_failure("interrupted before any byte", valid,
+            sizeof(valid) - 1, 0);
+    failed += check_handler_failure("interrupted inside a multibyte character",
+            valid, sizeof(valid) - 1, 9);
+    failed += check_handler_failure("interrupted in the last line", valid,
+            sizeof(valid) - 1, sizeof(valid) - 3);
+    failed += check_handler_failure("interrupted before the invalid byte",
+            with_bad_byte, sizeof(with_bad_byte) - 1, 12);
+    failed += check_handler_failure("interrupted at the invalid byte",
+            with_bad_byte, sizeof(with_bad_byte) - 1, 13);
+
+    printf("checking interrupted input diagnostics: %d fail(s)\n", failed);
+    return failed;
+}
+
+int check_chunked_diagnostics(void)
+{
+    static const unsigned char valid[] = "a: caf\xc3\xa9 \xe6\x97\xa5\n";
+    static const unsigned char split_2[] = "a: \xd0\xbf\xd1\x80\n";
+    static const unsigned char split_4[] = "a: \xf0\x9f\x98\x80\n";
+    static const unsigned char bom_valid[] =
+        "\xef\xbb\xbf" "a: \xe6\x97\xa5\n";
+    static const unsigned char bom_bad_cont[] =
+        "\xef\xbb\xbf" "a: \xe0\xa0\x41\n";
+    static const unsigned char bom_truncated[] =
+        "\xef\xbb\xbf" "a: \xe0\xa0";
+    static const unsigned char bad_cont_near_valid[] =
+        "a: b\xc3\xa9\xe0\xa0\x41\n";
+    static const unsigned char bad_lead_near_valid[] = "a: b\xff\n";
+    static const unsigned char doc_then_bad[] = "a: b\n\xff";
+    static const unsigned char docs_then_bad[] =
+        "a: b\n---\nc: d\n---\ne: \xff";
+    static const unsigned char utf16_valid[] =
+        "\xff\xfe" "H\x00i\x00 \x00x\x00";
+    static const unsigned char utf16_truncated[] = "\xff\xfe" "H";
+    static const unsigned char utf16_bad_surrogate[] = "\xff\xfe\x00\xdc";
+    int failed = 0;
+
+    printf("checking chunked reader diagnostics...\n");
+
+    failed += check_chunking("valid utf-8", valid, sizeof(valid) - 1, 0);
+    failed += check_chunking("split 2-byte character", split_2,
+            sizeof(split_2) - 1, 0);
+    failed += check_chunking("split 4-byte character", split_4,
+            sizeof(split_4) - 1, 0);
+    failed += check_chunking("bom at stream head", bom_valid,
+            sizeof(bom_valid) - 1, 0);
+    failed += check_chunking("bom plus invalid continuation", bom_bad_cont,
+            sizeof(bom_bad_cont) - 1, 1);
+    failed += check_chunking("bom plus truncated character", bom_truncated,
+            sizeof(bom_truncated) - 1, 1);
+    failed += check_chunking("invalid continuation after valid characters",
+            bad_cont_near_valid, sizeof(bad_cont_near_valid) - 1, 1);
+    failed += check_chunking("invalid lead byte after valid characters",
+            bad_lead_near_valid, sizeof(bad_lead_near_valid) - 1, 1);
+    failed += check_chunking("one document then an invalid byte", doc_then_bad,
+            sizeof(doc_then_bad) - 1, 1);
+    failed += check_chunking("two documents then an invalid byte",
+            docs_then_bad, sizeof(docs_then_bad) - 1, 1);
+    failed += check_chunking("valid utf-16", utf16_valid,
+            sizeof(utf16_valid) - 1, 0);
+    failed += check_chunking("truncated utf-16", utf16_truncated,
+            sizeof(utf16_truncated) - 1, 1);
+    failed += check_chunking("invalid utf-16 surrogate", utf16_bad_surrogate,
+            sizeof(utf16_bad_surrogate) - 1, 1);
+
+    printf("checking chunked reader diagnostics: %d fail(s)\n", failed);
+    return failed;
+}
+
 int
 main(void)
 {
-    return check_utf8_sequences() + check_boms() + check_long_utf8() + check_long_utf16();
+    return check_utf8_sequences() + check_boms() + check_long_utf8()
+        + check_long_utf16() + check_chunked_diagnostics()
+        + check_interrupted_input();
 }
