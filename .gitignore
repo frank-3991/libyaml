@@ -43,5 +43,6 @@ stamp-h1
 /tests/run-test-suite
 /tests/test-nesting
 /tests/test-reader
+/tests/test-recursion-budget
 /tests/test-version
 /dist/

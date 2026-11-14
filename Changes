@@ -1,3 +1,12 @@
+Unreleased
+
+Add configurable per-parser recursion/reference budget
+(yaml_parser_set_recursion_budget / yaml_parser_get_recursion_budget)
+to bound combined collection nesting and alias expansion, reject cyclic
+and undefined aliases and duplicate anchors explicitly, and destroy any
+partially built document on failure. Disabled by default for backward
+compatibility.
+
 0.2.5 2020-06-01
 
 https://github.com/yaml/libyaml/pull/105

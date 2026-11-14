@@ -195,6 +195,10 @@ yaml_parser_initialize(yaml_parser_t *parser)
         goto error;
     if (!STACK_INIT(parser, parser->tag_directives, yaml_tag_directive_t*))
         goto error;
+    if (!STACK_INIT(parser, parser->defined_anchors, yaml_char_t**))
+        goto error;
+    if (!STACK_INIT(parser, parser->open_anchors, yaml_char_t**))
+        goto error;
 
     return 1;
 
@@ -208,6 +212,8 @@ error:
     STACK_DEL(parser, parser->states);
     STACK_DEL(parser, parser->marks);
     STACK_DEL(parser, parser->tag_directives);
+    STACK_DEL(parser, parser->defined_anchors);
+    STACK_DEL(parser, parser->open_anchors);
 
     return 0;
 }
@@ -237,6 +243,14 @@ yaml_parser_delete(yaml_parser_t *parser)
         yaml_free(tag_directive.prefix);
     }
     STACK_DEL(parser, parser->tag_directives);
+    while (!STACK_EMPTY(parser, parser->defined_anchors)) {
+        yaml_free(POP(parser, parser->defined_anchors));
+    }
+    STACK_DEL(parser, parser->defined_anchors);
+    while (!STACK_EMPTY(parser, parser->open_anchors)) {
+        yaml_free(POP(parser, parser->open_anchors));
+    }
+    STACK_DEL(parser, parser->open_anchors);
 
     memset(parser, 0, sizeof(yaml_parser_t));
 }

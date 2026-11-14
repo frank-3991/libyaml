@@ -182,6 +182,195 @@ yaml_set_max_nest_level(int max)
 }
 
 /*
+ * Recursion/reference budget controls.
+ */
+
+YAML_DECLARE(int)
+yaml_parser_get_recursion_budget(const yaml_parser_t *parser)
+{
+    return parser->recursion_budget;
+}
+
+YAML_DECLARE(void)
+yaml_parser_set_recursion_budget(yaml_parser_t *parser, int budget)
+{
+    parser->recursion_budget = budget > 0 ? budget : 0;
+}
+
+/*
+ * Free every entry held in the anchor stacks and empty them.
+ */
+
+static void
+yaml_parser_clear_anchor_stacks(yaml_parser_t *parser)
+{
+    while (!STACK_EMPTY(parser, parser->defined_anchors))
+        yaml_free(POP(parser, parser->defined_anchors));
+    while (!STACK_EMPTY(parser, parser->open_anchors))
+        yaml_free(POP(parser, parser->open_anchors));
+}
+
+/*
+ * Return 1 if an anchor with the given name is defined in the document.
+ */
+
+static int
+yaml_parser_anchor_is_defined(yaml_parser_t *parser,
+        const yaml_char_t *name)
+{
+    yaml_char_t **entry;
+
+    for (entry = parser->defined_anchors.start;
+            entry != parser->defined_anchors.top; entry ++) {
+        if (strcmp((const char *)*entry, (const char *)name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Return 1 if an anchor with the given name belongs to a collection that
+ * is still open.
+ */
+
+static int
+yaml_parser_anchor_is_open(yaml_parser_t *parser, const yaml_char_t *name)
+{
+    yaml_char_t **entry;
+
+    for (entry = parser->open_anchors.start;
+            entry != parser->open_anchors.top; entry ++) {
+        if (*entry && strcmp((const char *)*entry, (const char *)name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Record a newly defined anchor, rejecting duplicate names.  The parser
+ * keeps its own copy of the name because the originating event is freed
+ * by the caller immediately after it is produced.
+ */
+
+static int
+yaml_parser_record_anchor(yaml_parser_t *parser, const yaml_char_t *name,
+        yaml_mark_t mark)
+{
+    yaml_char_t *copy;
+
+    if (!name) return 1;
+
+    if (yaml_parser_anchor_is_defined(parser, name))
+        return yaml_parser_set_parser_error(parser,
+                "found duplicate anchor", mark);
+
+    copy = yaml_strdup(name);
+    if (!copy) {
+        parser->error = YAML_MEMORY_ERROR;
+        return 0;
+    }
+    if (!PUSH(parser, parser->defined_anchors, copy)) {
+        yaml_free(copy);
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * Apply the recursion/reference budget and the anchor validity rules to a
+ * freshly produced event.  Returns 0 and sets a parser error on budget
+ * overflow, cyclic or undefined aliases, or duplicate anchors.
+ */
+
+static int
+yaml_parser_track_event(yaml_parser_t *parser, yaml_event_t *event)
+{
+    yaml_char_t *anchor;
+    yaml_char_t *open_copy;
+
+    switch (event->type)
+    {
+        case YAML_DOCUMENT_START_EVENT:
+            /* Each document gets a fresh budget and anchor table. */
+            yaml_parser_clear_anchor_stacks(parser);
+            parser->recursion_remaining = parser->recursion_budget;
+            break;
+
+        case YAML_DOCUMENT_END_EVENT:
+        case YAML_STREAM_END_EVENT:
+            yaml_parser_clear_anchor_stacks(parser);
+            break;
+
+        case YAML_ALIAS_EVENT:
+            anchor = event->data.alias.anchor;
+
+            if (!yaml_parser_anchor_is_defined(parser, anchor))
+                return yaml_parser_set_parser_error(parser,
+                        "found undefined alias", event->start_mark);
+
+            if (yaml_parser_anchor_is_open(parser, anchor))
+                return yaml_parser_set_parser_error(parser,
+                        "found cyclic alias reference", event->start_mark);
+
+            if (parser->recursion_remaining <= 0)
+                return yaml_parser_set_parser_error(parser,
+                        "recursion reference budget exceeded",
+                        event->start_mark);
+
+            /* An alias is an expansion step with no closing event. */
+            parser->recursion_remaining --;
+            break;
+
+        case YAML_SCALAR_EVENT:
+            if (!yaml_parser_record_anchor(parser,
+                        event->data.scalar.anchor, event->start_mark))
+                return 0;
+            break;
+
+        case YAML_SEQUENCE_START_EVENT:
+        case YAML_MAPPING_START_EVENT:
+            anchor = (event->type == YAML_SEQUENCE_START_EVENT)
+                ? event->data.sequence_start.anchor
+                : event->data.mapping_start.anchor;
+
+            if (parser->recursion_remaining <= 0)
+                return yaml_parser_set_parser_error(parser,
+                        "recursion reference budget exceeded",
+                        event->start_mark);
+            parser->recursion_remaining --;
+
+            if (!yaml_parser_record_anchor(parser, anchor, event->start_mark))
+                return 0;
+
+            open_copy = anchor ? yaml_strdup(anchor) : NULL;
+            if (anchor && !open_copy) {
+                parser->error = YAML_MEMORY_ERROR;
+                return 0;
+            }
+            if (!PUSH(parser, parser->open_anchors, open_copy)) {
+                yaml_free(open_copy);
+                return 0;
+            }
+            break;
+
+        case YAML_SEQUENCE_END_EVENT:
+        case YAML_MAPPING_END_EVENT:
+            /* Close the matching open collection and refund its unit. */
+            if (!STACK_EMPTY(parser, parser->open_anchors)) {
+                yaml_free(POP(parser, parser->open_anchors));
+                parser->recursion_remaining ++;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return 1;
+}
+
+/*
  * Get the next event.
  */
 
@@ -204,7 +393,18 @@ yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event)
 
     /* Generate the next event. */
 
-    return yaml_parser_state_machine(parser, event);
+    if (!yaml_parser_state_machine(parser, event))
+        return 0;
+
+    /* Enforce the optional recursion/reference budget and anchor rules. */
+
+    if (parser->recursion_budget > 0 &&
+            !yaml_parser_track_event(parser, event)) {
+        yaml_event_delete(event);
+        return 0;
+    }
+
+    return 1;
 }
 
 /*

@@ -1306,6 +1306,41 @@ typedef struct yaml_parser_s {
      * @}
      */
 
+    /**
+     * @name Recursion budget
+     * @{
+     */
+
+    /** The configured recursion/reference budget; 0 disables the feature. */
+    int recursion_budget;
+
+    /** The remaining budget for the document currently being parsed. */
+    int recursion_remaining;
+
+    /** The anchor names defined in the current document (owned strings). */
+    struct {
+        /** The beginning of the stack. */
+        yaml_char_t **start;
+        /** The end of the stack. */
+        yaml_char_t **end;
+        /** The top of the stack. */
+        yaml_char_t **top;
+    } defined_anchors;
+
+    /** The anchors of the collections currently open (owned strings). */
+    struct {
+        /** The beginning of the stack. */
+        yaml_char_t **start;
+        /** The end of the stack. */
+        yaml_char_t **end;
+        /** The top of the stack. */
+        yaml_char_t **top;
+    } open_anchors;
+
+    /**
+     * @}
+     */
+
 } yaml_parser_t;
 
 /**
@@ -1485,6 +1520,48 @@ yaml_get_max_nest_level();
 
 YAML_DECLARE(void)
 yaml_set_max_nest_level(int max);
+
+/** @} */
+
+#define LIBYAML_FEATURE_RECURSION_BUDGET
+
+/**
+ * Get the recursion/reference budget of a parser.
+ *
+ * The budget bounds, with a single counter, the combined nesting of
+ * collections and the expansion of alias references while composing a
+ * document.  Each opened collection and each resolved alias consumes one
+ * unit; closing a collection refunds its unit.  When the budget is
+ * exhausted, or an alias is cyclic or undefined, parsing fails and any
+ * partially built document is destroyed.
+ *
+ * A value of @c 0 (the default) disables the feature and preserves the
+ * historical behavior.  The budget is reset for every document in the
+ * stream.
+ *
+ * @param[in]       parser      A parser object.
+ *
+ * @returns The configured recursion budget, or @c 0 if the feature is
+ *          disabled.
+ */
+
+YAML_DECLARE(int)
+yaml_parser_get_recursion_budget(const yaml_parser_t *parser);
+
+/**
+ * Set the recursion/reference budget of a parser.
+ *
+ * A non-positive value disables the feature.  The setting applies to every
+ * document subsequently parsed by this parser and may be changed at any
+ * time between documents.
+ *
+ * @param[in,out]   parser      A parser object.
+ * @param[in]       budget      The maximum combined nesting and alias
+ *                              depth, or a non-positive value to disable.
+ */
+
+YAML_DECLARE(void)
+yaml_parser_set_recursion_budget(yaml_parser_t *parser, int budget);
 
 /** @} */
 
